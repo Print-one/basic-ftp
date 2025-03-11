@@ -44,6 +44,29 @@ function doNothing() {
     /** Do nothing */
 }
 
+class QueueDeferredPromise {
+    public promise: Promise<void>
+    private _resolve?: () => void
+    private resolved: boolean
+
+    constructor() {
+        this.resolved = false
+
+        this.promise = new Promise((resolve) => {
+            if (this.resolved) {
+                // in case resolve was called before promise was initialized
+                resolve()
+            }
+            this._resolve = resolve
+        })
+    }
+
+    resolve() {
+        this.resolved = true
+        this._resolve?.()
+    }
+}
+
 /**
  * FTPContext holds the control and data sockets of an FTP connection and provides a
  * simplified way to interact with an FTP server, handle responses, errors and timeouts.
@@ -70,6 +93,8 @@ export class FTPContext {
     protected _socket: Socket | TLSSocket
     /** FTP data connection */
     protected _dataSocket: Socket | TLSSocket | undefined
+    /** Queue of tasks to wait for before running the next task. */
+    protected _taskQueue: QueueDeferredPromise[]
 
     /**
      * Instantiate an FTP context.
@@ -82,6 +107,7 @@ export class FTPContext {
         // Help Typescript understand that we do indeed set _socket in the constructor but use the setter method to do so.
         this._socket = this.socket = this._newSocket()
         this._dataSocket = undefined
+        this._taskQueue = []
     }
 
     /**
@@ -246,7 +272,17 @@ export class FTPContext {
      * Send an FTP command and handle any response until you resolve/reject. Use this if you expect multiple responses
      * to a request. This returns a Promise that will hold whatever the response handler passed on when resolving/rejecting its task.
      */
-    handle(command: string | undefined, responseHandler: ResponseHandler): Promise<any> {
+    async handle(command: string | undefined, responseHandler: ResponseHandler): Promise<any> {
+        const thisTaskQueuePromise = new QueueDeferredPromise()
+        this._taskQueue.push(thisTaskQueuePromise)
+
+        // Wait for currently running, and tasks ahead of us in the queue
+        // We don't run them at the same time, because this library does not support that (see original error below)
+        await Promise.all(this._taskQueue
+            .filter(task => task !== thisTaskQueuePromise)
+            .map(task => task.promise)
+        )
+
         if (this._task) {
             const err = new Error("User launched a task while another one is still running. Forgot to use 'await' or '.then()'?")
             err.stack += `\nRunning task launched at: ${this._task.stack}`
@@ -255,7 +291,7 @@ export class FTPContext {
             // because the context closed already. That way, users will receive an exception where
             // they called this method by mistake.
         }
-        return new Promise((resolveTask, rejectTask) => {
+        return await new Promise((resolveTask, rejectTask) => {
             this._task = {
                 stack: new Error().stack || "Unknown call stack",
                 responseHandler,
@@ -263,10 +299,14 @@ export class FTPContext {
                     resolve: arg => {
                         this._stopTrackingTask()
                         resolveTask(arg)
+                        thisTaskQueuePromise.resolve()
+                        this._taskQueue = this._taskQueue.filter(task => task !== thisTaskQueuePromise)
                     },
                     reject: err => {
                         this._stopTrackingTask()
                         rejectTask(err)
+                        thisTaskQueuePromise.resolve()
+                        this._taskQueue = this._taskQueue.filter(task => task !== thisTaskQueuePromise)
                     }
                 }
             }
